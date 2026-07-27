@@ -1,0 +1,11 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+*.csv
+*.gpkg
+*.dbf
+*.qmd
+.Rprofile
+renv
+renv.lock

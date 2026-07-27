@@ -1,0 +1,442 @@
+---
+title: "BioCondition Field Operations Prioritisation Tool — Technical Documentation"
+subtitle: "Priority Scoring Methodology & Implementation"
+author: "Brodie Verrall, Gabrielle Lebbink"
+date: "2026-07-17"
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    toc_float: true
+    theme: flatly
+    highlight: tango
+  pdf_document:
+    toc: true
+    toc_depth: 4
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+---
+
+## Overview
+
+This tool generates a prioritisation ranking for Regional Ecosystems (REs)
+requiring BioCondition field assessments. REs are scored across several
+dimensions — benchmark site deficit, vegetation extent decline, pre‑clearing
+extent, remnant extent, SBC model deficits, benchmark reliability, and
+benchmark requests — each weighted to reflect operational priority.
+
+The output is a statewide and bioregional ranking, decile, and tier
+classification (Very High, High, Medium, Low, Very Low). Spatial layers
+(pre‑clearing and remnant GeoPackages) are annotated with the priority
+attributes and exported alongside a CSV summary table.
+
+---
+
+## Pipeline Summary
+
+| Section | Purpose |
+|---------|---------|
+| 0 | Environment setup: packages, directories |
+| 1 | Import source data: RE extents, benchmarks, site records |
+| 2 | Process RE extents: pre‑clearing & remnant area calculation |
+| 3 | Build RE assessment dataset: join attributes |
+| 4 | Benchmark information: selection, analogues, requests |
+| 5 | Site counts: eligible QBEIS/QBERD sites, large‑tree data |
+| **6** | **Generate Prioritisation Ranking ← core function** |
+| 7 | Export CSV, GeoPackage outputs |
+
+---
+
+## Section 6 — Prioritisation Function
+
+The function `calc_benchmark_priority()` performs all ranking logic.
+
+### Function Signature
+
+```r
+calc_benchmark_priority(
+  df, analogue_scores, sbc_defs, bm_reliability, re_codes,
+  benchmark_target = 3,
+  wt_deficit      = 0.175,   # benchmark site deficit
+  wt_decline      = 0.125,   # proportional vegetation loss
+  wt_extent       = 0.200,   # preclear extent
+  wt_remnant      = 0.050,   # remnant extent
+  wt_sbc          = 0.025,   # SBC modelling deficit
+  wt_reliability  = 0.100,   # automated benchmark reliability
+  wt_request      = 0.125,   # BM requests
+  wt_return       = 0.250    # analogue influence (return score multiplier)
+)
+```
+
+### Scoring Eligibility (`score_required`)
+
+An RE receives a priority score only if at least one deficit remains:
+
+```r
+BM_effective = if_else(BM == "Y" & status == "draft", "N", BM)
+
+score_required =
+  (BM_effective == "Y" &  sbc_deficit > 0) |
+  (BM_effective != "Y" & (benchmark_deficit > 0 | sbc_deficit > 0))
+```
+
+- **Benchmark available** → scored only if an SBC gap exists.
+- **No benchmark (or draft status)** → scored if any site deficit or SBC gap
+  exists. Benchmarks with `status = "draft"` are treated as not yet available,
+  so the RE is still eligible for prioritisation.
+- REs that already meet all criteria (effective benchmark present + no SBC
+  gap) are excluded from ranking and receive `NA`.
+
+
+### Factor Breakdown
+
+Each factor is normalised using the internal `norm01()` function before
+entering the weighted sum:
+
+```r
+norm01 <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if ((rng[2] - rng[1]) == 0) return(rep(0, length(x)))
+  (x - rng[1]) / (rng[2] - rng[1])
+}
+```
+
+This produces a 0–1 scale. The reliability factor is then inverted
+(`1 - scaled`) so that lower reliability yields a higher contribution.
+
+#### 1. Benchmark Site Deficit — `wt_deficit = 0.175`
+
+Target: 3 standard (or large‑tree) sites per RE.
+
+```r
+BM_effective = if_else(BM == "Y" & status == "draft", "N", BM)
+
+benchmark_deficit = case_when(
+  BM_effective == "Y"  ~ 0,
+  TRUE                 ~ pmax(benchmark_target - benchmark_sites, 0)
+)
+```
+
+Large‑tree data are required for wooded REs; non‑wooded REs use standard
+site counts. If an effective benchmark already exists (published or
+unpublished — but not draft), the deficit is set to 0. Draft benchmarks are
+treated as not yet available.
+
+#### 2. Vegetation Decline — `wt_decline = 0.125`
+
+```r
+decline_prop = if_else(Preclear_ha > 0, Difference_ha / Preclear_ha, 0)
+```
+
+The proportional loss of extent since pre‑clearing. Higher decline → greater
+priority.
+
+#### 3. Pre‑clearing Extent — `wt_extent = 0.200`
+
+```r
+extent_scaled = norm01(log1p(Preclear_ha))
+```
+
+Log‑transformed pre‑clearing area. Larger extents score higher, reflecting
+the broader spatial impact.
+
+#### 4. Remnant Extent — `wt_remnant = 0.050`
+
+```r
+remnant_scaled = norm01(log1p(Remnant_ha))
+```
+
+Log‑transformed remnant area. A small weight acknowledges that REs with very
+little remaining area warrant attention.
+
+#### 5. SBC Model Deficit — `wt_sbc = 0.025`
+
+```r
+  sbc_deficit = if_else(
+    RE1 == "11.9.5" | benchmark_sites > 10, 0,
+    pmax(coalesce(TD_ref_combined_deficit, 0), 0)
+  )
+```
+
+The training‑data gap for State‑wide BioCondition modelling. Capped at 0
+(minimum). Zeroed for RE `11.9.5` (east–west benchmark alignment artefact)
+and for any RE with more than 10 benchmark‑quality sites
+(`benchmark_sites > 10`), as these already have abundant field data. A small
+weight reflects that SBC deficits are secondary to field benchmark needs.
+
+#### 6. Benchmark Reliability — `wt_reliability = 0.100`
+
+Missing reliability scores are handled in three tiers:
+
+```r
+has_reliability =
+  !is.na(overall_reliability) | (RE1 %in% re_codes)
+
+reliability_score = if_else(
+  !is.na(overall_reliability), overall_reliability, 0
+)
+
+reliability_deficit_scaled = 1 - norm01(reliability_score)
+```
+
+| Case | Treatment |
+|------|-----------|
+| RE has a reliability score in `BM_automisation_data` | Used as-is |
+| Valid RE (in `regional_ecosystem.csv`) missing from reliability data | `reliability_score = 0` → maximum priority contribution |
+| Non‑standard RE code not in `regional_ecosystem.csv` | `has_reliability = FALSE` → term is zeroed out in `need_score` |
+
+The reliability term is only included when `has_reliability = TRUE`.
+
+#### 7. Benchmark Requests — `wt_request = 0.125`
+
+```r
+request_scaled = norm01(bm_requests_2526)
+```
+
+Count of pending benchmark requests for the 2025–26 cycle. A larger number
+of requests increases priority.
+
+#### 8. Analogue Influence (Return Score) — `wt_return = 0.250`
+
+```r
+analogue_influence = sum(analogue_weight)  # rank_1=8, rank_2=4, rank_3=2, rank_4=1
+return_score = norm01(analogue_influence)
+```
+
+The "return" component — REs with strong analogue benchmarks provide
+high information return for the effort. Applied as a multiplier rather than
+an additive term.
+
+---
+
+### Final Priority Score Formula
+
+```r
+need_score =
+  wt_deficit      * deficit_scaled +
+  wt_decline      * decline_scaled +
+  wt_extent       * extent_scaled +
+  wt_remnant      * remnant_scaled +
+  wt_sbc          * sbc_scaled +
+  wt_reliability  * reliability_deficit_scaled +  # conditional on has_reliability
+  wt_request      * request_scaled
+
+priority_score = need_score * (1 + wt_return * return_score)
+```
+
+- **`need_score`** — additive weighted sum of all deficit/risk factors
+- **`return_score`** — multiplicative boost for high‑analogue REs
+- The final `priority_score` ranks REs statewide and within bioregions
+
+---
+
+### Weight Summary Table
+
+| Factor | Weight | Direction | Rationale |
+|--------|--------|-----------|-----------|
+| Benchmark site deficit | 0.175 | ↑ deficit ↑ priority | Sites are the primary field need |
+| Vegetation decline | 0.125 | ↑ decline ↑ priority | Threatened ecosystems |
+| Pre‑clearing extent | 0.200 | ↑ extent ↑ priority | Landscape‑scale impact |
+| Remnant extent | 0.050 | ↑ remnant ↑ priority | Small remnants need attention |
+| SBC deficit | 0.025 | ↑ deficit ↑ priority | Modelling data gap |
+| Benchmark reliability | 0.100 | ↓ reliability ↑ priority | Prioritise uncertain benchmarks |
+| BM requests | 0.125 | ↑ requests ↑ priority | Operational demand signal |
+| **Analogue return** | **0.250** | **(multiplier)** | Efficiency / information gain |
+
+---
+
+### RE Code Handling
+
+To maximise matching between source datasets, RE codes are cleaned inside the
+function before the reliability join:
+
+```r
+RE_lookup = case_when(
+  str_detect(RE1, "/")                        ~ str_extract(RE1, "^[^/]+"),
+  RE1 %in% c("11.9.5_eastern", "11.9.5_western") ~ "11.9.5",
+  TRUE                                        ~ RE1
+)
+```
+
+- **Compound REs** (e.g. `11.3.25/11.3.1`) — use the first code only
+- **`11.9.5_eastern` / `11.9.5_west`** — map to base RE `11.9.5` for
+  reliability lookup
+- The SBC deficit for `11.9.5` is forced to 0 (east–west benchmark artefact)
+
+---
+
+## Outputs
+
+| File | Contents |
+|------|----------|
+| `YYYYMMDD_BC_deficit.csv` | Tabular priority results with all attributes |
+| `YYYYMMDD_RE_PC_v14_PRIORITISED.gpkg` | Pre‑clearing spatial layer with priority fields |
+| `YYYYMMDD_RE_RE_v14_PRIORITISED.gpkg` | Remnant spatial layer with priority fields |
+
+### Priority Fields
+
+- `RE1`, `BR_code`, `LZ_code`, `VC_code` — ecosystem identifiers
+- `Preclear_ha`, `Remnant_ha`, `Difference_ha` — extent metrics
+- `benchmark_deficit`, `sbc_deficit`, `lt_deficit` — component deficits
+- `priority_score`, `priority_rank`, `priority_decile`, `priority_tier` — statewide
+- `priority_rank_BR`, `priority_decile_BR`, `priority_tier_BR` — bioregional
+- `prioritisation_flag` — descriptive category with SBC gap annotation
+- Biodiversity status, VMA class, protected area coverage, and more
+
+---
+
+## Dependencies
+
+```{r deps, echo=FALSE}
+packages <- c("dplyr", "tidyr", "stringr", "arrow", "sf", "cli", "lubridate")
+cat(paste0("- ", packages, collapse = "\n"))
+```
+
+---
+
+## Notes
+
+- Run from the project root. The script automatically detects or creates a
+  `project_data/` subdirectory.
+- Verify input datasets (RE, BM, SBC) are current before each run.
+- The `benchmark_target = 3` default reflects the standard BioCondition
+  requirement of three representative sites per RE.
+- Non‑standard RE codes (e.g. `af` suffixes, compound codes) that cannot be
+  matched to the reliability table are excluded from the reliability
+  component but still scored on remaining factors.
+
+---
+
+## Detailed Section Breakdown
+
+### Section 0 — Environment Setup
+
+The script activates the project working directory under `project_data/`
+and ensures all required R packages (`dplyr`, `tidyr`, `stringr`, `arrow`,
+`sf`, `cli`, `lubridate`) are installed and loaded. Input and output
+subdirectories (`inputs/`, `outputs/`) are created if absent.
+
+### Section 1 — Import Source Data
+
+Seven tabular datasets and two spatial GeoPackages are loaded:
+
+| File | Object | Contents |
+|------|--------|----------|
+| `All_summary_data.csv` | `all_data` | Site‑level QBEIS/QBERD data |
+| `BENCHMARK_MASTER_LIST_v14.0.csv` | `bm_master` | Benchmark registry |
+| `ranked_re_cleanlong_EDL(in).csv` | `bm_analogous` | Analogue RE rankings |
+| `BM_automisation_data.csv` | `bm_reliability` | Automated reliability scores |
+| `BM_requests_2526.csv` | `bm_requests` | Pending BM development requests |
+| `20250904_SBC_trainingData_deficit.csv` | `sbc_defs` | SBC model training gaps |
+| `regional_ecosystem.csv` | `re_v14` | RE metadata and attributes |
+| `preclear_v14_3577.gpkg` | `re_pc_v14` | Pre‑clearing spatial polygons |
+| `remnant_v14_3577.gpkg` | `re_re_v14` | Remnant spatial polygons |
+
+Spatial geometries are dropped after reading to produce tabular extent
+summaries for efficient joining.
+
+### Section 2 — Process RE Extents
+
+RE metadata is parsed by splitting the `NAME` field into bioregion (`BR_code`),
+land zone (`LZ_code`), and vegetation community (`VC_code`) components.
+Mapped extents from the REDD database are extracted from the
+`MAPPED_EXTENTS` field.
+
+Pre‑clearing and remnant spatial layers are grouped by `RE1` and aggregated
+to produce:
+
+- `Preclear_ha` — total pre‑clearing area (hectares)
+- `Remnant_ha` — total remnant area (hectares)
+- `Difference_ha` — Preclear_ha − Remnant_ha (clearing extent)
+- `RE_parent` — base RE code with variant suffix stripped
+
+### Section 3 — Build RE Assessment Dataset
+
+The RE extent table is joined with ecosystem attributes from
+`regional_ecosystem.csv`, including structural classification, short/long
+descriptions, biodiversity status, VMA class, protected area coverage, and
+habitat notes. This forms the base table `bc_re1` that accumulates all
+subsequent joins.
+
+### Section 4 — Benchmark Information
+
+**4.1 Benchmark Selection** (`bm_selected`):
+The Benchmark Master List is filtered to retain the most recent published
+benchmark entry per RE. For REs with structural variance (multiple BM.RE
+codes), all variant codes are concatenated. The `status` field (draft, final
+unpublished, final published) is retained and used within the scoring
+function to treat draft benchmarks as not yet available for prioritisation
+purposes.
+
+**4.2 Benchmark Requests** (`bm_requests_2526`):
+Request counts from the 2025–26 cycle are joined to `bm_selected`. REs
+without requests receive a count of `0L`.
+
+**4.3 Benchmark Analogues** (`analogue_scores`):
+The analogue dataset is processed by the helper function
+`process_analogues()`, which assigns numeric weights to each analogue rank
+(rank\_1 = 8, rank\_2 = 4, rank\_3 = 2, rank\_4 = 1) and sums them per RE
+to produce `analogue_influence`.
+
+**4.4 Benchmark Reliability**:
+Handled within the scoring function in Section 6 (see Reliability breakdown
+above).
+
+### Section 5 — Generate Site Counts
+
+Eligible sites are selected from `all_data` based on database origin and data
+quality criteria:
+
+- **QBEIS sites**: floristic sample grades A, B, or C and representative
+  flag = 1.
+- **QBERD sites**: site type matching "reference", "remnant", or "ref"
+  (case‑insensitive), or representative flag = 1 with a CORVEG site type.
+
+Two site‑count tables are produced:
+
+| Table | Count Field | Description |
+|-------|-------------|-------------|
+| `site_counts_all` | `QBEIS_rep`, `QBERD_rep` | All eligible sites |
+| `site_counts_large_trees` | `QBEIS_rep_LT`, `QBERD_rep_LT` | Sites with large‑tree data |
+
+No‑match and unassignable RE codes are excluded. The two tables are
+full‑joined and merged into `bc_re1` alongside the benchmark selection.
+
+Rows with missing or empty `VC_code` are removed after these joins,
+ensuring only valid REs proceed to scoring.
+
+### Section 6 — Generate Prioritisation Ranking
+
+This is the core of the tool. See the dedicated section above for the full
+methodology covering:
+
+- RE code cleaning (`RE_lookup`) for compound and variant codes
+- `score_required` eligibility logic
+- All eight factor calculations with their weights
+- The two‑component `need_score` × `(1 + wt_return × return_score)` formula
+- Statewide and bioregional ranking, decile, and tier assignment
+
+### Section 7 — Generate Prioritisation Outputs
+
+**7.1–7.2 — Tabular export**:
+A predefined field list (`priority_fields`) is selected from the scored
+table and written to `outputs/{date}_BC_deficit.csv`.
+
+**7.3–7.4 — Spatial annotation**:
+Pre‑clearing and remnant GeoPackages are read, geometries are cleaned (Z‑dimension
+dropped, cast to `MULTIPOLYGON`), and priority attributes are joined by `RE1`.
+Rows with missing `VC_code` are excluded.
+
+**7.5–7.6 — Spatial export**:
+Output fields are selected (spatial identifiers + all priority fields) and
+written to:
+
+- `outputs/{date}_RE_PC_v14_PRIORITISED.gpkg`
+- `outputs/{date}_RE_RE_v14_PRIORITISED.gpkg`
+
+Both GeoPackages are overwritten (`delete_dsn = TRUE`) to ensure clean
+outputs on each run.
